@@ -12,20 +12,19 @@ const {
 } = process.env;
 
 if (!BOT_TOKEN || !ADMIN_CHAT_ID || !WEBHOOK_SECRET) {
-    console.error('Missing required env vars.');
+    console.error('Missing required environment variables.');
     process.exit(1);
 }
 
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 const DB_PATH = path.join(__dirname, 'data', 'devices.json');
 
-// ---- tiny JSON-file store ----
+// --- Helper Functions ---
 function loadStore() {
     try {
+        if (!fs.existsSync(DB_PATH)) return {};
         return JSON.parse(fs.readFileSync(DB_PATH, 'utf8'));
-    } catch {
-        return {};
-    }
+    } catch { return {}; }
 }
 
 function saveStore(store) {
@@ -33,58 +32,45 @@ function saveStore(store) {
     fs.writeFileSync(DB_PATH, JSON.stringify(store, null, 2));
 }
 
-// ---- telegram helpers ----
 async function tg(method, body) {
-    const res = await fetch(`${TELEGRAM_API}/${method}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-    });
-    return res.json();
-}
-
-function requireApiKey(req, res, next) {
-    if (!API_KEY) return next();
-    if (req.get('X-API-Key') !== API_KEY) {
-        return res.status(401).json({ error: 'unauthorized' });
+    try {
+        const res = await fetch(`${TELEGRAM_API}/${method}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        return await res.json();
+    } catch (e) {
+        console.error(`Telegram API Error (${method}):`, e);
+        return { ok: false };
     }
-    next();
 }
 
 const app = express();
 app.use(express.json());
 
-// 1 & 2. Handle Requests, Spam Prevention, and Re-installs
-app.post('/request', requireApiKey, async (req, res) => {
+// --- Endpoints ---
+
+// 1. Android App Request
+app.post('/request', (req, res) => {
     const { key, device_id } = req.body || {};
-    if (!key || !device_id) {
-        return res.status(400).json({ error: 'key and device_id required' });
-    }
+    if (!key || !device_id) return res.status(400).json({ error: 'Missing data' });
 
     const store = loadStore();
     const existing = store[device_id];
 
-    if (existing) {
-        // Prevent Telegram Spam: If already pending, just return pending
-        if (existing.status === 'pending') {
-            return res.json({ status: 'pending' });
-        }
-        // Normal check-in: If the key matches, return the saved status
-        if (existing.key === key) {
-            return res.json({ status: existing.status });
-        }
-        // If the device ID exists but the key is DIFFERENT, they reinstalled the app.
-        // It will fall through to the logic below to request fresh approval.
+    // Spam prevention: if already pending, don't re-notify Telegram
+    if (existing && existing.status === 'pending') {
+        return res.json({ status: 'pending' });
     }
 
+    // Mark as pending and notify
     store[device_id] = { status: 'pending', key, requested_at: Date.now() };
     saveStore(store);
 
-    const text = `New license request\nDevice: ${device_id}\nKey: ${key}\n\nStatus: PENDING`;
-    
-    await tg('sendMessage', {
+    tg('sendMessage', {
         chat_id: ADMIN_CHAT_ID,
-        text,
+        text: `New license request\nDevice: ${device_id}\nKey: ${key}`,
         reply_markup: {
             inline_keyboard: [
                 [
@@ -98,52 +84,38 @@ app.post('/request', requireApiKey, async (req, res) => {
     res.json({ status: 'pending' });
 });
 
-// App polls this until status is no longer "pending"
-app.get('/status', requireApiKey, (req, res) => {
+// 2. Android App Heartbeat
+app.get('/status', (req, res) => {
     const { device_id } = req.query;
-    if (!device_id) return res.status(400).json({ error: 'device_id required' });
-
     const store = loadStore();
-    const entry = store[device_id];
-    res.json({ status: entry ? entry.status : 'unknown' });
+    res.json({ status: store[device_id] ? store[device_id].status : 'denied' });
 });
 
-// 3. Webhook with dynamic Revoke/Approve buttons
+// 3. Telegram Webhook (The "Fix" for stuck buttons)
 app.post(`/telegram-webhook/:secret`, async (req, res) => {
     if (req.params.secret !== WEBHOOK_SECRET) return res.sendStatus(404);
 
     const cb = req.body.callback_query;
     if (cb && cb.data) {
+        // Acknowledge the click immediately to stop loading animation
+        await tg('answerCallbackQuery', { callback_query_id: cb.id });
+
         const [action, deviceId] = cb.data.split(':');
         const store = loadStore();
 
         if (store[deviceId]) {
-            // Determine the new status
-            let newStatus = store[deviceId].status;
-            if (action === 'approve') newStatus = 'approved';
-            if (action === 'deny' || action === 'revoke') newStatus = 'denied';
-
-            store[deviceId].status = newStatus;
-            store[deviceId].decided_at = Date.now();
+            store[deviceId].status = (action === 'approve') ? 'approved' : 'denied';
             saveStore(store);
 
-            // Dynamically swap the buttons
-            let newKeyboard = [];
-            if (newStatus === 'approved') {
-                newKeyboard = [[ { text: '🚫 Revoke Access', callback_data: `revoke:${deviceId}` } ]];
-            } else {
-                newKeyboard = [[ { text: '✅ Re-Approve', callback_data: `approve:${deviceId}` } ]];
-            }
-
-            await tg('answerCallbackQuery', {
-                callback_query_id: cb.id,
-                text: newStatus === 'approved' ? 'Approved!' : 'Denied/Revoked!',
-            });
+            // Update Telegram message buttons dynamically
+            const newKeyboard = (store[deviceId].status === 'approved') 
+                ? [[ { text: '🚫 Revoke Access', callback_data: `deny:${deviceId}` } ]]
+                : [[ { text: '✅ Re-Approve', callback_data: `approve:${deviceId}` } ]];
 
             await tg('editMessageText', {
                 chat_id: cb.message.chat.id,
                 message_id: cb.message.message_id,
-                text: `License managed\nDevice: ${deviceId}\nKey: ${store[deviceId].key}\n\nStatus: ${newStatus.toUpperCase()}`,
+                text: `License managed\nDevice: ${deviceId}\nStatus: ${store[deviceId].status.toUpperCase()}`,
                 reply_markup: { inline_keyboard: newKeyboard }
             });
         }
@@ -151,5 +123,4 @@ app.post(`/telegram-webhook/:secret`, async (req, res) => {
     res.sendStatus(200);
 });
 
-app.listen(PORT, () => console.log(`License backend listening on :${PORT}`));
-
+app.listen(PORT, () => console.log(`Backend live on port ${PORT}`));
